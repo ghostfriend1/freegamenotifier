@@ -19,7 +19,7 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID") or 0)
 PING_ROLE_ID = int(os.getenv("PING_ROLE_ID") or 0)
 CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES") or 15)
-OWNER_ID = int(os.getenv("OWNER_ID", 0))          # ← Add your Discord User ID here
+OWNER_ID = int(os.getenv("OWNER_ID", 0))          # Your Discord User ID (required for /clearold and /sync)
 DB_FILE = "free_games_v3.db"
 
 GAMERPOWER_BASE = "https://gamerpower.com/api"
@@ -40,9 +40,17 @@ class Database:
     def __init__(self):
         self.conn = sqlite3.connect(DB_FILE, check_same_thread=False)
         self.conn.execute("""CREATE TABLE IF NOT EXISTS seen_games (
-            giveaway_id TEXT PRIMARY KEY, title TEXT, platform TEXT, source TEXT,
-            first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP, last_posted TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
-        self.conn.execute("""CREATE TABLE IF NOT EXISTS bot_stats (key TEXT PRIMARY KEY, value TEXT)""")
+            giveaway_id TEXT PRIMARY KEY,
+            title TEXT,
+            platform TEXT,
+            source TEXT,
+            first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_posted TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+        self.conn.execute("""CREATE TABLE IF NOT EXISTS bot_stats (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )""")
         self.conn.commit()
 
     def is_seen(self, giveaway_id: str) -> bool:
@@ -90,7 +98,7 @@ class FreeGameNotifier(commands.Bot):
 
     async def setup_hook(self):
         if not DISCORD_TOKEN or not CHANNEL_ID:
-            logger.error("Missing DISCORD_TOKEN or CHANNEL_ID in .env")
+            logger.error("Missing DISCORD_TOKEN or CHANNEL_ID in environment variables")
             return
 
         self.session = aiohttp.ClientSession()
@@ -100,9 +108,9 @@ class FreeGameNotifier(commands.Bot):
 
         channel = self.get_channel(CHANNEL_ID)
         if channel:
-            await channel.send("🚀 **Free Game Notifier v3.6** online • Use `/clearold` to clean old bot messages.")
+            await channel.send("🚀 **Free Game Notifier v3.6** is online • `/clearold` to clean old messages • `/sync` to refresh commands.")
 
-    # ===================== CLEAR OLD BOT MESSAGES =====================
+    # ===================== CLEAR OLD MESSAGES =====================
     @app_commands.command(name="clearold", description="Delete the bot's old notification messages (owner only)")
     @app_commands.describe(amount="Number of bot messages to delete (default 50, max 500)")
     async def clearold(self, interaction: discord.Interaction, amount: int = 50):
@@ -110,9 +118,7 @@ class FreeGameNotifier(commands.Bot):
             await interaction.response.send_message("❌ Only the bot owner can use this command.", ephemeral=True)
             return
 
-        if amount < 1 or amount > 500:
-            amount = 50
-
+        amount = min(max(amount, 1), 500)
         await interaction.response.defer(ephemeral=True)
 
         channel = self.get_channel(CHANNEL_ID)
@@ -124,36 +130,29 @@ class FreeGameNotifier(commands.Bot):
             return message.author.id == self.user.id
 
         try:
-            deleted = await channel.purge(limit=amount, check=is_bot_message, bulk=True)
-            count = len(deleted)
-            await interaction.followup.send(
-                f"✅ Deleted **{count}** old bot notification message(s) from the channel.",
-                ephemeral=True
-            )
-            logger.info(f"Cleared {count} old bot messages via /clearold")
+            deleted = await channel.purge(limit=amount, check=is_bot_message)
+            await interaction.followup.send(f"✅ Deleted **{len(deleted)}** old bot messages.", ephemeral=True)
+            logger.info(f"Cleared {len(deleted)} old bot messages")
         except discord.Forbidden:
-            await interaction.followup.send("❌ Missing 'Manage Messages' permission in the channel.", ephemeral=True)
+            await interaction.followup.send("❌ Bot missing 'Manage Messages' permission.", ephemeral=True)
         except Exception as e:
-            logger.error(f"Clearold failed: {e}")
-            await interaction.followup.send(f"❌ Error while clearing messages: {e}", ephemeral=True)
+            logger.error(f"Clearold error: {e}")
+            await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
 
-    # ===================== SYNC COMMAND (Owner Only) =====================
+    # ===================== SYNC COMMAND =====================
     @app_commands.command(name="sync", description="Force sync slash commands (owner only)")
     async def sync(self, interaction: discord.Interaction):
         if interaction.user.id != OWNER_ID:
-            await interaction.response.send_message("❌ You are not authorized.", ephemeral=True)
+            await interaction.response.send_message("❌ Not authorized.", ephemeral=True)
             return
-
         await interaction.response.defer(ephemeral=True)
         try:
-            await self.tree.clear_commands(guild=None)
             synced = await self.tree.sync()
-            await interaction.followup.send(f"✅ Synced {len(synced)} global commands.", ephemeral=True)
+            await interaction.followup.send(f"✅ Synced {len(synced)} commands globally.", ephemeral=True)
         except Exception as e:
             await interaction.followup.send(f"❌ Sync failed: {e}", ephemeral=True)
 
-    # (The rest of the code - check_free_games, fetch_new_free_games, create_game_embed, fgstatus, current_free - stays exactly the same as v3.5)
-
+    # ===================== GAME CHECKING =====================
     @tasks.loop(minutes=CHECK_INTERVAL_MINUTES)
     async def check_free_games(self):
         try:
@@ -161,48 +160,49 @@ class FreeGameNotifier(commands.Bot):
             new_games = await self.fetch_new_free_games()
 
             if not new_games:
-                logger.info("No new games found this cycle.")
+                logger.info("No new games found.")
                 self.db.update_last_check()
                 return
 
             channel = self.get_channel(CHANNEL_ID)
             if not channel:
-                logger.error(f"Channel {CHANNEL_ID} not found!")
+                logger.error("Channel not found")
                 return
 
             ping = f"<@&{PING_ROLE_ID}>" if PING_ROLE_ID else "@here"
-            posted_count = 0
-
             for game in new_games:
                 embed, view = self.create_game_embed(game)
-                await channel.send(
-                    f"{ping} **New FREE / Promo Game Dropped!**",
-                    embed=embed,
-                    view=view
-                )
-                self.db.mark_seen(
-                    game["id"], game["title"], game.get("platform", "Unknown"), game.get("source", "Unknown")
-                )
-                posted_count += 1
+                await channel.send(f"{ping} **New FREE / Promo Game Dropped!**", embed=embed, view=view)
+                self.db.mark_seen(game["id"], game["title"], game.get("platform", "Unknown"), game.get("source", "Unknown"))
 
-            logger.info(f"🚀 Successfully posted {posted_count} new game(s)")
+            logger.info(f"🚀 Successfully posted {len(new_games)} new game(s)")
             self.db.update_last_check()
 
         except Exception as e:
-            logger.exception("Critical error in check_free_games task")
+            logger.exception("Critical error in check_free_games")
             channel = self.get_channel(CHANNEL_ID)
             if channel:
-                await channel.send("⚠️ **Notifier encountered a transient error** (will retry automatically).")
+                await channel.send("⚠️ Notifier encountered an error (will retry).")
+
+    async def _fetch_with_retry(self, url: str, params: Optional[Dict] = None, max_retries: int = 3):
+        for attempt in range(max_retries):
+            try:
+                async with self.session.get(url, params=params, timeout=20) as resp:
+                    resp.raise_for_status()
+                    return await resp.json()
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    logger.error(f"Fetch failed for {url}: {e}")
+                    raise
+                await asyncio.sleep(2 ** attempt * 1.5)
+        return None
 
     async def fetch_new_free_games(self) -> List[Dict[str, Any]]:
         new_games: List[Dict[str, Any]] = []
 
         # GamerPower
         try:
-            data = await self._fetch_with_retry(
-                f"{GAMERPOWER_BASE}/giveaways",
-                params={"platform": "pc", "type": "game", "sort-by": "date"}
-            )
+            data = await self._fetch_with_retry(f"{GAMERPOWER_BASE}/giveaways", {"platform": "pc", "type": "game", "sort-by": "date"})
             if isinstance(data, list):
                 for item in data:
                     gid = str(item.get("id") or "")
@@ -221,14 +221,11 @@ class FreeGameNotifier(commands.Bot):
                             "is_promo": str(item.get("worth", "")).startswith("$")
                         })
         except Exception as e:
-            logger.error(f"GamerPower fetch failed: {e}")
+            logger.error(f"GamerPower failed: {e}")
 
         # Epic Games
         try:
-            epic_data = await self._fetch_with_retry(
-                EPIC_API,
-                params={"locale": EPIC_LOCALE, "country": EPIC_COUNTRY}
-            )
+            epic_data = await self._fetch_with_retry(EPIC_API, {"locale": EPIC_LOCALE, "country": EPIC_COUNTRY})
             if epic_data and isinstance(epic_data.get("data"), dict):
                 elements = epic_data["data"].get("Catalog", {}).get("searchStore", {}).get("elements", [])
                 for elem in elements:
@@ -238,8 +235,7 @@ class FreeGameNotifier(commands.Bot):
                             if offer.get("discountSetting", {}).get("discountPercentage") == 0:
                                 gid = f"epic_{elem.get('id') or elem.get('productSlug')}"
                                 if gid and not self.db.is_seen(gid):
-                                    image = next((img.get("url") for img in elem.get("keyImages", []) 
-                                                  if img.get("type") in ("Thumbnail", "OfferImageWide", "DieselStoreFrontTall")), None)
+                                    image = next((img.get("url") for img in elem.get("keyImages", []) if img.get("type") in ("Thumbnail", "OfferImageWide")), None)
                                     new_games.append({
                                         "id": gid,
                                         "title": elem.get("title", "Unknown Epic Game"),
@@ -254,7 +250,7 @@ class FreeGameNotifier(commands.Bot):
                                         "is_promo": True
                                     })
         except Exception as e:
-            logger.error(f"Epic fetch failed: {e}")
+            logger.error(f"Epic failed: {e}")
 
         # Deduplication
         seen = set()
@@ -290,11 +286,7 @@ class FreeGameNotifier(commands.Bot):
             embed.set_thumbnail(url=game["image"])
 
         embed.add_field(name="🔗 Claim Link", value=f"[Open Giveaway]({claim_url})", inline=False)
-        embed.add_field(
-            name="📈 Trends • Player Base • Hype",
-            value=f"[🔍 Google Trends]({trends_url})\nPlatform: {platform}\nSource: {game.get('source', 'Unknown')}",
-            inline=False,
-        )
+        embed.add_field(name="📈 Trends • Hype", value=f"[🔍 Google Trends]({trends_url})\nPlatform: {platform}\nSource: {game.get('source', 'Unknown')}", inline=False)
 
         if game.get("end_date"):
             embed.add_field(name="⏰ Expires", value=game["end_date"], inline=True)
@@ -304,26 +296,21 @@ class FreeGameNotifier(commands.Bot):
         view = ClaimView(claim_url, trends_url, gamerpower_url)
         return embed, view
 
-    @app_commands.command(name="fgstatus", description="Show free game notifier health & stats")
+    @app_commands.command(name="fgstatus", description="Show bot status")
     async def fgstatus(self, interaction: discord.Interaction):
         last = self.db.get_last_check() or "Never"
         count = self.db.get_seen_count()
         await interaction.response.send_message(
-            f"**Free Game Notifier v3.6 Status**\n"
-            f"✅ Online\n"
-            f"📊 Games tracked: **{count}**\n"
-            f"🕒 Last check: {last}\n"
-            f"🔄 Interval: {CHECK_INTERVAL_MINUTES} min\n"
-            f"🗑️ Use /clearold to clean old messages",
+            f"**Free Game Notifier v3.6**\n✅ Online\n📊 Games tracked: {count}\n🕒 Last check: {last}\n🔄 Interval: {CHECK_INTERVAL_MINUTES} min",
             ephemeral=True
         )
 
-    @app_commands.command(name="currentfree", description="List current free/promos (top 5)")
+    @app_commands.command(name="currentfree", description="Show current free games (top 5)")
     async def current_free(self, interaction: discord.Interaction):
         await interaction.response.defer()
         games = await self.fetch_new_free_games()
         if not games:
-            await interaction.followup.send("No active free/promos right now.")
+            await interaction.followup.send("No active free games right now.")
             return
         for game in games[:5]:
             embed, view = self.create_game_embed(game)
@@ -332,8 +319,7 @@ class FreeGameNotifier(commands.Bot):
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN or not CHANNEL_ID:
-        logger.error("Missing DISCORD_TOKEN or CHANNEL_ID in .env")
+        logger.error("Missing DISCORD_TOKEN or CHANNEL_ID")
         exit(1)
-
     bot = FreeGameNotifier()
     bot.run(DISCORD_TOKEN)
