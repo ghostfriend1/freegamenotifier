@@ -1,4 +1,4 @@
-# free_game_notifier_v3.py
+# main.py
 import os
 import asyncio
 import logging
@@ -80,7 +80,7 @@ class Database:
 
 class ClaimView(discord.ui.View):
     def __init__(self, claim_url: str, trends_url: str, gamerpower_url: str):
-        super().__init__(timeout=3600)  # 1 hour
+        super().__init__(timeout=3600)
         self.add_item(discord.ui.Button(label="🔗 Claim Now", url=claim_url, style=discord.ButtonStyle.success))
         self.add_item(discord.ui.Button(label="📈 Google Trends", url=trends_url, style=discord.ButtonStyle.primary))
         self.add_item(discord.ui.Button(label="📋 GamerPower Page", url=gamerpower_url, style=discord.ButtonStyle.secondary))
@@ -96,9 +96,8 @@ class FreeGameNotifier(commands.Bot):
     async def setup_hook(self):
         self.session = aiohttp.ClientSession()
         self.check_free_games.start()
-        await self.tree.sync()  # Slash commands
+        await self.tree.sync()
         logger.info("✅ v3 Slash commands synced & background task started")
-        # Startup health ping
         channel = self.get_channel(CHANNEL_ID)
         if channel:
             await channel.send("🚀 **Free Game Notifier v3 is online and monitoring all major platforms!**")
@@ -110,7 +109,6 @@ class FreeGameNotifier(commands.Bot):
         await super().close()
 
     async def _fetch_with_retry(self, url: str, params: Optional[Dict] = None, max_retries: int = 3) -> Any:
-        """Zero-ban-risk retry wrapper – public endpoints only."""
         for attempt in range(max_retries):
             try:
                 async with self.session.get(url, params=params, timeout=15) as resp:
@@ -120,7 +118,7 @@ class FreeGameNotifier(commands.Bot):
                 if attempt == max_retries - 1:
                     logger.error("API fetch failed after %d retries: %s", max_retries, e)
                     raise
-                await asyncio.sleep(2 ** attempt)  # exponential backoff
+                await asyncio.sleep(2 ** attempt)
         return None
 
     @tasks.loop(minutes=CHECK_INTERVAL_MINUTES)
@@ -148,16 +146,12 @@ class FreeGameNotifier(commands.Bot):
             logger.exception("Error in check_free_games: %s", e)
             channel = self.get_channel(CHANNEL_ID)
             if channel:
-                await channel.send(f"⚠️ **Notifier encountered a transient error** (will retry automatically). {e}")
+                await channel.send(f"⚠️ **Notifier encountered a transient error** (will retry automatically).")
 
     async def fetch_new_free_games(self) -> List[Dict[str, Any]]:
         new_games = []
 
-        # 1. GamerPower – covers Steam, Epic, GOG, itch.io, Ubisoft, etc. (includes paid→free promos)
-        data = await self._fetch_with_retry(
-            f"{GAMERPOWER_BASE}/giveaways",
-            params={"platform": "pc", "type": "game", "sort-by": "date"}
-        )
+        data = await self._fetch_with_retry(f"{GAMERPOWER_BASE}/giveaways", params={"platform": "pc", "type": "game", "sort-by": "date"})
         if data:
             for item in data:
                 gid = str(item.get("id"))
@@ -173,11 +167,10 @@ class FreeGameNotifier(commands.Bot):
                         "open_giveaway_url": item.get("open_giveaway_url", "https://gamerpower.com"),
                         "gamerpower_url": f"https://gamerpower.com/giveaway/{gid}",
                         "source": "GamerPower",
-                        "is_promo": item.get("worth", "").startswith("$")  # paid → free flag
+                        "is_promo": item.get("worth", "").startswith("$")
                     }
                     new_games.append(game)
 
-        # 2. Epic fallback (rock-solid for weekly promos)
         epic_data = await self._fetch_with_retry(
             "https://store-site-backend-static.ak.epicgames.com/freeGamesPromotions",
             params={"locale": EPIC_LOCALE, "country": EPIC_COUNTRY, "size": 1000}
@@ -203,7 +196,6 @@ class FreeGameNotifier(commands.Bot):
                             "is_promo": True
                         })
 
-        # Dedupe + safety
         seen = set()
         deduped = []
         for g in new_games:
@@ -219,7 +211,6 @@ class FreeGameNotifier(commands.Bot):
         claim_url = game.get("open_giveaway_url", "https://gamerpower.com")
         gamerpower_url = game.get("gamerpower_url", "https://gamerpower.com")
 
-        # Paid → free callout
         worth = game.get("worth", "Free")
         promo_text = f"**Was {worth} → FREE for limited time!**" if game.get("is_promo") and worth != "Free" else "FREE now!"
 
@@ -249,24 +240,19 @@ class FreeGameNotifier(commands.Bot):
         view = ClaimView(claim_url, trends_url, gamerpower_url)
         return embed, view
 
-    @app_commands.command(name="status", description="Show notifier health & stats")
-    async def status(self, interaction: discord.Interaction):
+    @app_commands.command(name="fgstatus", description="Show free game notifier health & stats")
+    async def fgstatus(self, interaction: discord.Interaction):
         last = self.db.get_last_check() or "Never"
         count = self.db.get_seen_count()
         await interaction.response.send_message(
-            f"**Free Game Notifier v3 Status**\n"
-            f"✅ Online\n"
-            f"📊 Games tracked: {count}\n"
-            f"🕒 Last check: {last}\n"
-            f"🔄 Checking every {CHECK_INTERVAL_MINUTES} min\n"
-            f"🛡️ Public read-only APIs – 100% ban-proof",
+            f"**Free Game Notifier v3 Status**\n✅ Online\n📊 Games tracked: {count}\n🕒 Last check: {last}\n🔄 Checking every {CHECK_INTERVAL_MINUTES} min\n🛡️ Public read-only APIs – 100% ban-proof",
             ephemeral=True
         )
 
     @app_commands.command(name="currentfree", description="List current free/promos (top 5)")
     async def current_free(self, interaction: discord.Interaction):
         await interaction.response.defer()
-        games = await self.fetch_new_free_games()  # re-use logic
+        games = await self.fetch_new_free_games()
         if not games:
             await interaction.followup.send("No active free/promos right now.")
             return
@@ -276,10 +262,7 @@ class FreeGameNotifier(commands.Bot):
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN or not CHANNEL_ID:
-        logger.error("Missing DISCORD_TOKEN or CHANNEL_ID in .env")
+        logger.error("Missing DISCORD_TOKEN or CHANNEL_ID")
         exit(1)
     bot = FreeGameNotifier()
-    try:
-        asyncio.run(bot.start(DISCORD_TOKEN))
-    finally:
-        logger.info("v3 Bot shutting down cleanly")
+    asyncio.run(bot.start(DISCORD_TOKEN))
