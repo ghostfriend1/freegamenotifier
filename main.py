@@ -45,7 +45,8 @@ class Database:
                 title TEXT,
                 platform TEXT,
                 source TEXT,
-                first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_posted TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
@@ -64,9 +65,14 @@ class Database:
         return cursor.fetchone() is not None
 
     def mark_seen(self, giveaway_id: str, title: str, platform: str, source: str = "Unknown"):
+        now = datetime.now(timezone.utc).isoformat()
         self.conn.execute(
-            "INSERT OR IGNORE INTO seen_games (giveaway_id, title, platform, source) VALUES (?, ?, ?, ?)",
-            (giveaway_id, title, platform, source)
+            """
+            INSERT OR REPLACE INTO seen_games 
+            (giveaway_id, title, platform, source, last_posted) 
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (giveaway_id, title, platform, source, now)
         )
         self.conn.commit()
 
@@ -101,6 +107,7 @@ class ClaimView(discord.ui.View):
 class FreeGameNotifier(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
+        intents.message_content = True   # Removes the intent warning
         super().__init__(command_prefix="!", intents=intents)
         self.db = Database()
         self.session: Optional[aiohttp.ClientSession] = None
@@ -113,11 +120,11 @@ class FreeGameNotifier(commands.Bot):
         self.session = aiohttp.ClientSession()
         self.check_free_games.start()
         await self.tree.sync()
-        logger.info("✅ Free Game Notifier v3.3 started - Slash commands synced")
+        logger.info("✅ Free Game Notifier v3.4 (Strong Anti-Repost) started")
 
         channel = self.get_channel(CHANNEL_ID)
         if channel:
-            await channel.send("🚀 **Free Game Notifier v3.3 is online** (GamerPower + Epic)")
+            await channel.send("🚀 **Free Game Notifier v3.4** is online – Anti-repost protection enabled.")
 
     async def close(self):
         if self.session:
@@ -133,7 +140,7 @@ class FreeGameNotifier(commands.Bot):
                     return await resp.json()
             except Exception as e:
                 if attempt == max_retries - 1:
-                    logger.error(f"Failed to fetch {url} after {max_retries} attempts: {e}")
+                    logger.error(f"Failed to fetch {url}: {e}")
                     raise
                 await asyncio.sleep(2 ** attempt * 1.5)
         return None
@@ -156,6 +163,7 @@ class FreeGameNotifier(commands.Bot):
 
             ping = f"<@&{PING_ROLE_ID}>" if PING_ROLE_ID else "@here"
 
+            posted_count = 0
             for game in new_games:
                 embed, view = self.create_game_embed(game)
                 await channel.send(
@@ -166,8 +174,9 @@ class FreeGameNotifier(commands.Bot):
                 self.db.mark_seen(
                     game["id"], game["title"], game.get("platform", "Unknown"), game.get("source", "Unknown")
                 )
+                posted_count += 1
 
-            logger.info(f"🚀 Successfully posted {len(new_games)} new game(s)")
+            logger.info(f"🚀 Successfully posted {posted_count} new game(s)")
             self.db.update_last_check()
 
         except Exception as e:
@@ -205,7 +214,7 @@ class FreeGameNotifier(commands.Bot):
         except Exception as e:
             logger.error(f"GamerPower fetch failed: {e}")
 
-        # ===================== EPIC GAMES (safer parsing) =====================
+        # ===================== EPIC GAMES =====================
         try:
             epic_data = await self._fetch_with_retry(
                 EPIC_API,
@@ -219,11 +228,9 @@ class FreeGameNotifier(commands.Bot):
 
                     for offer_set in promo_offers:
                         for offer in offer_set.get("promotionalOffers", []):
-                            discount = offer.get("discountSetting", {}).get("discountPercentage")
-                            if discount == 0:
+                            if offer.get("discountSetting", {}).get("discountPercentage") == 0:
                                 gid = f"epic_{elem.get('id') or elem.get('productSlug')}"
                                 if gid and not self.db.is_seen(gid):
-                                    # Safe image extraction
                                     image = next(
                                         (img.get("url") for img in elem.get("keyImages", [])
                                          if img.get("type") in ("Thumbnail", "OfferImageWide", "DieselStoreFrontTall")),
@@ -245,7 +252,7 @@ class FreeGameNotifier(commands.Bot):
         except Exception as e:
             logger.error(f"Epic fetch failed: {e}")
 
-        # Deduplication by title + platform
+        # Strong deduplication
         seen = set()
         deduped = []
         for g in new_games:
@@ -264,7 +271,6 @@ class FreeGameNotifier(commands.Bot):
         worth = game.get("worth", "Free")
         promo_text = f"Was {worth} → FREE!" if game.get("is_promo") and worth != "Free" else "FREE now!"
 
-        # Fixed: import is now at the top
         query = urllib.parse.quote_plus(f"{title} {platform} player count hype")
         trends_url = f"https://trends.google.com/trends/explore?q={query}"
 
@@ -289,23 +295,23 @@ class FreeGameNotifier(commands.Bot):
         if game.get("end_date"):
             embed.add_field(name="⏰ Expires", value=game["end_date"], inline=True)
 
-        embed.set_footer(text="v3.3 • Public APIs only • Zero ban risk")
+        embed.set_footer(text="v3.4 • Strong Anti-Repost Protection • Public APIs only")
 
         view = ClaimView(claim_url, trends_url, gamerpower_url)
         return embed, view
 
-    # ===================== SLASH COMMANDS =====================
+    # Slash Commands
     @app_commands.command(name="fgstatus", description="Show free game notifier health & stats")
     async def fgstatus(self, interaction: discord.Interaction):
         last = self.db.get_last_check() or "Never"
         count = self.db.get_seen_count()
         await interaction.response.send_message(
-            f"**Free Game Notifier v3.3 Status**\n"
+            f"**Free Game Notifier v3.4 Status**\n"
             f"✅ Online\n"
             f"📊 Games tracked: **{count}**\n"
             f"🕒 Last check: {last}\n"
             f"🔄 Interval: {CHECK_INTERVAL_MINUTES} min\n"
-            f"🛡️ Public read-only APIs",
+            f"🛡️ Anti-repost protection active",
             ephemeral=True
         )
 
