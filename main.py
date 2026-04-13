@@ -1,13 +1,13 @@
-# free_game_notifier_v3.py
 import os
 import asyncio
 import logging
 import sqlite3
-import hashlib
-from datetime import datetime, timezone, timedelta
+import urllib.parse
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 import aiohttp
 from dotenv import load_dotenv
@@ -38,108 +38,36 @@ logger = logging.getLogger(__name__)
 class Database:
     def __init__(self):
         self.conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        self.create_tables()
-
-    def create_tables(self):
-        self.conn.execute("""
+        self.conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS seen_games (
-                unique_id TEXT PRIMARY KEY,
-                giveaway_id TEXT,
+                giveaway_id TEXT PRIMARY KEY,
                 title TEXT,
                 platform TEXT,
-                claim_url TEXT,
                 source TEXT,
-                first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-        """)
-        self.conn.execute("""
+            """
+        )
+        self.conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS bot_stats (
                 key TEXT PRIMARY KEY,
                 value TEXT
             )
-        """)
+            """
+        )
         self.conn.commit()
 
-    def _normalize_title(self, title: str) -> str:
-        if not title:
-            return ""
-        # Aggressive normalization to catch similar titles
-        return (title.strip()
-                .lower()
-                .replace("free", "")
-                .replace("giveaway", "")
-                .replace("promo", "")
-                .strip())
+    def is_seen(self, giveaway_id: str) -> bool:
+        cursor = self.conn.execute("SELECT 1 FROM seen_games WHERE giveaway_id = ?", (giveaway_id,))
+        return cursor.fetchone() is not None
 
-    def is_seen(self, giveaway_id: Optional[str] = None,
-                title: Optional[str] = None,
-                platform: Optional[str] = None,
-                claim_url: Optional[str] = None) -> bool:
-        """Multi-layer duplicate prevention"""
-        if not title:
-            return False
-
-        norm_title = self._normalize_title(title)
-
-        # Layer 1: giveaway_id (fastest when stable)
-        if giveaway_id:
-            cursor = self.conn.execute(
-                "SELECT 1 FROM seen_games WHERE giveaway_id = ?", (giveaway_id,)
-            )
-            if cursor.fetchone():
-                return True
-
-        # Layer 2: normalized title + platform
-        if platform:
-            cursor = self.conn.execute(
-                "SELECT 1 FROM seen_games WHERE title = ? AND platform = ?",
-                (norm_title, platform.lower())
-            )
-            if cursor.fetchone():
-                return True
-
-        # Layer 3: hash of title + claim_url (most robust)
-        if claim_url:
-            unique_key = hashlib.md5(f"{norm_title}{claim_url}".encode()).hexdigest()
-            cursor = self.conn.execute(
-                "SELECT 1 FROM seen_games WHERE unique_id = ?", (unique_key,)
-            )
-            if cursor.fetchone():
-                return True
-
-        return False
-
-    def mark_seen(self, giveaway_id: Optional[str] = None,
-                  title: str = "",
-                  platform: str = "Unknown",
-                  claim_url: Optional[str] = None,
-                  source: str = "Unknown"):
-        """Mark game as seen with multiple keys"""
-        if not title:
-            return
-
-        norm_title = self._normalize_title(title)
-        now = datetime.now(timezone.utc).isoformat()
-
-        # Generate stable unique_id
-        if claim_url:
-            unique_id = hashlib.md5(f"{norm_title}{claim_url}".encode()).hexdigest()
-        else:
-            unique_id = hashlib.md5(f"{norm_title}{platform}".encode()).hexdigest()
-
-        self.conn.execute("""
-            INSERT OR REPLACE INTO seen_games 
-            (unique_id, giveaway_id, title, platform, claim_url, source, last_seen)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (unique_id, giveaway_id, norm_title, platform.lower(), claim_url, source, now))
-        self.conn.commit()
-
-    def cleanup_old_entries(self, days: int = 90):
-        """Keep database clean"""
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-        self.conn.execute("DELETE FROM seen_games WHERE last_seen < ?", (cutoff,))
+    def mark_seen(self, giveaway_id: str, title: str, platform: str, source: str = "Unknown"):
+        self.conn.execute(
+            "INSERT OR IGNORE INTO seen_games (giveaway_id, title, platform, source) VALUES (?, ?, ?, ?)",
+            (giveaway_id, title, platform, source)
+        )
         self.conn.commit()
 
     def update_last_check(self):
@@ -152,7 +80,7 @@ class Database:
     def get_last_check(self) -> Optional[str]:
         cursor = self.conn.execute("SELECT value FROM bot_stats WHERE key = ?", ("last_check",))
         row = cursor.fetchone()
-        return row["value"] if row else None
+        return row[0] if row else None
 
     def get_seen_count(self) -> int:
         cursor = self.conn.execute("SELECT COUNT(*) FROM seen_games")
@@ -165,9 +93,9 @@ class Database:
 class ClaimView(discord.ui.View):
     def __init__(self, claim_url: str, trends_url: str, gamerpower_url: str):
         super().__init__(timeout=3600)
-        self.add_item(discord.ui.Button(label="Claim Now", url=claim_url, style=discord.ButtonStyle.success))
-        self.add_item(discord.ui.Button(label="Google Trends", url=trends_url, style=discord.ButtonStyle.primary))
-        self.add_item(discord.ui.Button(label="GamerPower Page", url=gamerpower_url, style=discord.ButtonStyle.secondary))
+        self.add_item(discord.ui.Button(label="🔗 Claim Now", url=claim_url, style=discord.ButtonStyle.success))
+        self.add_item(discord.ui.Button(label="📈 Google Trends", url=trends_url, style=discord.ButtonStyle.primary))
+        self.add_item(discord.ui.Button(label="📋 GamerPower Page", url=gamerpower_url, style=discord.ButtonStyle.secondary))
 
 
 class FreeGameNotifier(commands.Bot):
@@ -176,7 +104,6 @@ class FreeGameNotifier(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
         self.db = Database()
         self.session: Optional[aiohttp.ClientSession] = None
-        self.last_check: Optional[datetime] = None
 
     async def setup_hook(self):
         if not DISCORD_TOKEN or not CHANNEL_ID:
@@ -186,11 +113,11 @@ class FreeGameNotifier(commands.Bot):
         self.session = aiohttp.ClientSession()
         self.check_free_games.start()
         await self.tree.sync()
-        logger.info("Free Game Notifier v3.2 (anti-duplicate) started")
+        logger.info("✅ Free Game Notifier v3.3 started - Slash commands synced")
 
         channel = self.get_channel(CHANNEL_ID)
         if channel:
-            await channel.send("**Free Game Notifier v3.2 is online** — Improved duplicate prevention active!")
+            await channel.send("🚀 **Free Game Notifier v3.3 is online** (GamerPower + Epic)")
 
     async def close(self):
         if self.session:
@@ -206,129 +133,20 @@ class FreeGameNotifier(commands.Bot):
                     return await resp.json()
             except Exception as e:
                 if attempt == max_retries - 1:
-                    logger.error(f"API fetch failed after {max_retries} attempts: {e}")
+                    logger.error(f"Failed to fetch {url} after {max_retries} attempts: {e}")
                     raise
                 await asyncio.sleep(2 ** attempt * 1.5)
         return None
 
-    async def fetch_new_free_games(self) -> List[Dict[str, Any]]:
-        new_games: List[Dict[str, Any]] = []
-
-        # ===================== GAMERPOWER =====================
-        try:
-            data = await self._fetch_with_retry(
-                f"{GAMERPOWER_BASE}/giveaways",
-                params={"platform": "pc", "type": "game", "sort-by": "date"}
-            )
-            if isinstance(data, list):
-                for item in data:
-                    gid = str(item.get("id")) if item.get("id") else None
-                    title = item.get("title", "Unknown Game")
-                    platform = item.get("platform", "PC").title()
-                    claim_url = item.get("open_giveaway_url") or f"https://gamerpower.com/giveaway/{gid}"
-
-                    if self.db.is_seen(giveaway_id=gid, title=title, platform=platform, claim_url=claim_url):
-                        continue
-
-                    new_games.append({
-                        "id": gid,
-                        "title": title,
-                        "platform": platform,
-                        "description": (item.get("instructions") or item.get("description", ""))[:400],
-                        "image": item.get("image"),
-                        "worth": item.get("worth", "Free"),
-                        "end_date": item.get("end_date"),
-                        "open_giveaway_url": claim_url,
-                        "gamerpower_url": f"https://gamerpower.com/giveaway/{gid}" if gid else "https://gamerpower.com",
-                        "source": "GamerPower",
-                        "is_promo": str(item.get("worth", "")).startswith("$")
-                    })
-        except Exception as e:
-            logger.error(f"GamerPower fetch failed: {e}")
-
-        # ===================== EPIC GAMES =====================
-        try:
-            epic_data = await self._fetch_with_retry(
-                EPIC_API,
-                params={"locale": EPIC_LOCALE, "country": EPIC_COUNTRY, "size": 1000}
-            )
-            if epic_data and "data" in epic_data:
-                elements = epic_data.get("data", {}).get("Catalog", {}).get("searchStore", {}).get("elements", [])
-                for elem in elements:
-                    price_info = elem.get("price", {}).get("totalPrice", {}).get("fmtPrice", {})
-                    promotions = elem.get("promotions", {}).get("promotionalOffers")
-
-                    if price_info.get("discountPrice") in ("0", "Free") and promotions:
-                        title = elem.get("title", "Unknown Epic Game")
-                        product_slug = elem.get("productSlug") or ""
-                        claim_url = f"https://store.epicgames.com/en-US/p/{product_slug}" if product_slug else ""
-                        gid = elem.get("id") or product_slug
-
-                        if not claim_url or self.db.is_seen(
-                            giveaway_id=gid, title=title, platform="Epic Games Store", claim_url=claim_url
-                        ):
-                            continue
-
-                        # Get best image
-                        image = None
-                        for img in elem.get("keyImages", []):
-                            if img.get("type") in ("Thumbnail", "OfferImageWide", "DieselStoreFrontTall"):
-                                image = img.get("url")
-                                break
-
-                        new_games.append({
-                            "id": gid,
-                            "title": title,
-                            "platform": "Epic Games Store",
-                            "description": elem.get("description", "")[:400],
-                            "image": image,
-                            "worth": "Free (Epic Promo)",
-                            "end_date": None,
-                            "open_giveaway_url": claim_url,
-                            "gamerpower_url": claim_url,
-                            "source": "Epic Games",
-                            "is_promo": True
-                        })
-        except Exception as e:
-            logger.error(f"Epic fetch failed: {e}")
-
-        return new_games
-
-    def create_game_embed(self, game: Dict[str, Any]) -> tuple:
-        embed = discord.Embed(
-            title=f"🎮 {game['title']}",
-            description=game.get("description", "No description available."),
-            color=0x00ff00 if not game.get("is_promo") else 0xffaa00
-        )
-        if game.get("image"):
-            embed.set_image(url=game["image"])
-
-        embed.add_field(name="Platform", value=game.get("platform", "Unknown"), inline=True)
-        embed.add_field(name="Worth", value=game.get("worth", "Free"), inline=True)
-
-        if game.get("end_date"):
-            embed.add_field(name="Ends", value=game["end_date"], inline=True)
-
-        embed.set_footer(text=f"Source: {game.get('source', 'Unknown')} • Free Game Notifier v3.2")
-
-        trends_url = f"https://trends.google.com/trends/explore?q={urllib.parse.quote_plus(game['title'])}"
-        view = ClaimView(
-            claim_url=game["open_giveaway_url"],
-            trends_url=trends_url,
-            gamerpower_url=game.get("gamerpower_url", game["open_giveaway_url"])
-        )
-        return embed, view
-
     @tasks.loop(minutes=CHECK_INTERVAL_MINUTES)
     async def check_free_games(self):
         try:
-            logger.info("Checking for new free / promo games...")
+            logger.info("🔍 Checking for new free / promo games...")
             new_games = await self.fetch_new_free_games()
 
             if not new_games:
-                logger.info("No new games this cycle.")
+                logger.info("No new games found this cycle.")
                 self.db.update_last_check()
-                self.last_check = datetime.now(timezone.utc)
                 return
 
             channel = self.get_channel(CHANNEL_ID)
@@ -345,34 +163,168 @@ class FreeGameNotifier(commands.Bot):
                     embed=embed,
                     view=view
                 )
-                # Mark as seen ONLY after successful post
                 self.db.mark_seen(
-                    giveaway_id=game.get("id"),
-                    title=game["title"],
-                    platform=game.get("platform", "Unknown"),
-                    claim_url=game.get("open_giveaway_url"),
-                    source=game.get("source", "Unknown")
+                    game["id"], game["title"], game.get("platform", "Unknown"), game.get("source", "Unknown")
                 )
 
-            logger.info(f"Successfully posted {len(new_games)} new game(s)")
+            logger.info(f"🚀 Successfully posted {len(new_games)} new game(s)")
             self.db.update_last_check()
-            self.last_check = datetime.now(timezone.utc)
-
-            # Weekly cleanup
-            if datetime.now(timezone.utc).hour == 3:
-                self.db.cleanup_old_entries(days=75)
 
         except Exception as e:
-            logger.exception(f"Error in check_free_games: {e}")
+            logger.exception("Critical error in check_free_games task")
             channel = self.get_channel(CHANNEL_ID)
             if channel:
-                await channel.send("**Notifier encountered a transient error** (will retry automatically).")
+                await channel.send("⚠️ **Notifier encountered a transient error** (will retry automatically).")
+
+    async def fetch_new_free_games(self) -> List[Dict[str, Any]]:
+        new_games: List[Dict[str, Any]] = []
+
+        # ===================== GAMERPOWER =====================
+        try:
+            data = await self._fetch_with_retry(
+                f"{GAMERPOWER_BASE}/giveaways",
+                params={"platform": "pc", "type": "game", "sort-by": "date"}
+            )
+            if isinstance(data, list):
+                for item in data:
+                    gid = str(item.get("id") or "")
+                    if gid and not self.db.is_seen(gid):
+                        new_games.append({
+                            "id": gid,
+                            "title": item.get("title", "Unknown Game"),
+                            "platform": item.get("platforms", "PC"),
+                            "description": (item.get("instructions") or item.get("description", ""))[:400],
+                            "image": item.get("image"),
+                            "worth": item.get("worth", "Free"),
+                            "end_date": item.get("end_date"),
+                            "open_giveaway_url": item.get("open_giveaway_url") or "",
+                            "gamerpower_url": item.get("gamerpower_url", f"https://gamerpower.com/giveaway/{gid}"),
+                            "source": "GamerPower",
+                            "is_promo": str(item.get("worth", "")).startswith("$")
+                        })
+        except Exception as e:
+            logger.error(f"GamerPower fetch failed: {e}")
+
+        # ===================== EPIC GAMES (safer parsing) =====================
+        try:
+            epic_data = await self._fetch_with_retry(
+                EPIC_API,
+                params={"locale": EPIC_LOCALE, "country": EPIC_COUNTRY}
+            )
+            if epic_data and isinstance(epic_data.get("data"), dict):
+                elements = epic_data["data"].get("Catalog", {}).get("searchStore", {}).get("elements", [])
+                for elem in elements:
+                    promotions = elem.get("promotions") or {}
+                    promo_offers = promotions.get("promotionalOffers") or []
+
+                    for offer_set in promo_offers:
+                        for offer in offer_set.get("promotionalOffers", []):
+                            discount = offer.get("discountSetting", {}).get("discountPercentage")
+                            if discount == 0:
+                                gid = f"epic_{elem.get('id') or elem.get('productSlug')}"
+                                if gid and not self.db.is_seen(gid):
+                                    # Safe image extraction
+                                    image = next(
+                                        (img.get("url") for img in elem.get("keyImages", [])
+                                         if img.get("type") in ("Thumbnail", "OfferImageWide", "DieselStoreFrontTall")),
+                                        None
+                                    )
+                                    new_games.append({
+                                        "id": gid,
+                                        "title": elem.get("title", "Unknown Epic Game"),
+                                        "platform": "Epic Games Store",
+                                        "description": elem.get("description", "")[:400],
+                                        "image": image,
+                                        "worth": "Free",
+                                        "end_date": offer.get("endDate"),
+                                        "open_giveaway_url": f"https://store.epicgames.com/en-US/p/{elem.get('productSlug', '')}",
+                                        "gamerpower_url": "https://gamerpower.com",
+                                        "source": "Epic Games",
+                                        "is_promo": True
+                                    })
+        except Exception as e:
+            logger.error(f"Epic fetch failed: {e}")
+
+        # Deduplication by title + platform
+        seen = set()
+        deduped = []
+        for g in new_games:
+            key = (g["title"].lower().strip(), g.get("platform", ""))
+            if key not in seen:
+                seen.add(key)
+                deduped.append(g)
+        return deduped
+
+    def create_game_embed(self, game: Dict[str, Any]) -> tuple[discord.Embed, ClaimView]:
+        title = game.get("title", "Unknown Game")
+        platform = game.get("platform", "Unknown")
+        claim_url = game.get("open_giveaway_url") or "https://gamerpower.com"
+        gamerpower_url = game.get("gamerpower_url", "https://gamerpower.com")
+
+        worth = game.get("worth", "Free")
+        promo_text = f"Was {worth} → FREE!" if game.get("is_promo") and worth != "Free" else "FREE now!"
+
+        # Fixed: import is now at the top
+        query = urllib.parse.quote_plus(f"{title} {platform} player count hype")
+        trends_url = f"https://trends.google.com/trends/explore?q={query}"
+
+        embed = discord.Embed(
+            title=f"🎮 {title} — {promo_text}",
+            url=claim_url,
+            description=game.get("description", "No description available.")[:500],
+            color=0x00FF00,
+            timestamp=datetime.now(timezone.utc),
+        )
+
+        if game.get("image"):
+            embed.set_thumbnail(url=game["image"])
+
+        embed.add_field(name="🔗 Claim Link", value=f"[Open Giveaway]({claim_url})", inline=False)
+        embed.add_field(
+            name="📈 Trends • Player Base • Hype",
+            value=f"[🔍 Google Trends]({trends_url})\nPlatform: {platform}\nSource: {game.get('source', 'Unknown')}",
+            inline=False,
+        )
+
+        if game.get("end_date"):
+            embed.add_field(name="⏰ Expires", value=game["end_date"], inline=True)
+
+        embed.set_footer(text="v3.3 • Public APIs only • Zero ban risk")
+
+        view = ClaimView(claim_url, trends_url, gamerpower_url)
+        return embed, view
+
+    # ===================== SLASH COMMANDS =====================
+    @app_commands.command(name="fgstatus", description="Show free game notifier health & stats")
+    async def fgstatus(self, interaction: discord.Interaction):
+        last = self.db.get_last_check() or "Never"
+        count = self.db.get_seen_count()
+        await interaction.response.send_message(
+            f"**Free Game Notifier v3.3 Status**\n"
+            f"✅ Online\n"
+            f"📊 Games tracked: **{count}**\n"
+            f"🕒 Last check: {last}\n"
+            f"🔄 Interval: {CHECK_INTERVAL_MINUTES} min\n"
+            f"🛡️ Public read-only APIs",
+            ephemeral=True
+        )
+
+    @app_commands.command(name="currentfree", description="List current free/promos (top 5)")
+    async def current_free(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        games = await self.fetch_new_free_games()
+        if not games:
+            await interaction.followup.send("No active free/promos right now.")
+            return
+        for game in games[:5]:
+            embed, view = self.create_game_embed(game)
+            await interaction.followup.send(embed=embed, view=view)
 
 
-# ===================== RUN BOT =====================
 if __name__ == "__main__":
-    if not DISCORD_TOKEN:
-        logger.error("DISCORD_TOKEN not found in .env file!")
-    else:
-        bot = FreeGameNotifier()
-        bot.run(DISCORD_TOKEN)
+    if not DISCORD_TOKEN or not CHANNEL_ID:
+        logger.error("Missing DISCORD_TOKEN or CHANNEL_ID in .env")
+        exit(1)
+
+    bot = FreeGameNotifier()
+    bot.run(DISCORD_TOKEN)
