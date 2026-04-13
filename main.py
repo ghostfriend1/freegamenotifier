@@ -23,6 +23,8 @@ DB_FILE = "free_games_v3.db"
 
 GAMERPOWER_BASE = "https://gamerpower.com/api"
 EPIC_API = "https://store-site-backend-static.ak.epicgames.com/freeGamesPromotions"
+EPIC_LOCALE = "en-US"
+EPIC_COUNTRY = "US"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -31,6 +33,7 @@ logger = logging.getLogger(__name__)
 class Database:
     def __init__(self):
         self.conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        # seen_games table
         self.conn.execute("""CREATE TABLE IF NOT EXISTS seen_games (
             giveaway_id TEXT PRIMARY KEY,
             title TEXT,
@@ -38,16 +41,21 @@ class Database:
             source TEXT,
             last_posted TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
+        # bot_stats table (was missing)
+        self.conn.execute("""CREATE TABLE IF NOT EXISTS bot_stats (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )""")
         self.conn.commit()
 
     def should_post(self, giveaway_id: str) -> bool:
-        """Return True if we haven't posted this game in the last 24 hours"""
+        """Only post if not posted in the last 24 hours"""
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
         row = self.conn.execute(
             "SELECT 1 FROM seen_games WHERE giveaway_id = ? AND last_posted > ?",
             (giveaway_id, cutoff)
         ).fetchone()
-        return row is None   # Not posted recently → should post
+        return row is None
 
     def mark_posted(self, giveaway_id: str, title: str, platform: str, source: str = "Unknown"):
         now = datetime.now(timezone.utc).isoformat()
@@ -87,20 +95,20 @@ class FreeGameNotifier(commands.Bot):
         self.session = aiohttp.ClientSession()
         self.check_free_games.start()
         await self.tree.sync()
-        logger.info("✅ Free Game Notifier v4.3 (Current Free Games) started")
+        logger.info("✅ Free Game Notifier v4.4 (Current Free PC Games) started")
 
         channel = self.get_channel(CHANNEL_ID)
         if channel:
-            await channel.send("🚀 **Free Game Notifier v4.3** is online — Now showing **currently free PC games**!")
+            await channel.send("🚀 **Free Game Notifier v4.4** is online — Monitoring **currently free PC games** from GamerPower + Epic!")
 
     @tasks.loop(minutes=CHECK_INTERVAL_MINUTES, reconnect=True)
     async def check_free_games(self):
         try:
             logger.info("🔍 Checking for currently free PC games...")
-            current_free_games = await self.fetch_current_free_games()
+            current_games = await self.fetch_current_free_games()
 
-            if not current_free_games:
-                logger.info("No currently free PC games found.")
+            if not current_games:
+                logger.info("No currently free PC games found this cycle.")
                 self.db.update_last_check()
                 return
 
@@ -112,7 +120,7 @@ class FreeGameNotifier(commands.Bot):
             ping = f"<@&{PING_ROLE_ID}>" if PING_ROLE_ID else "@here"
             posted = 0
 
-            for game in current_free_games:
+            for game in current_games:
                 if self.db.should_post(game["id"]):
                     embed, view = self.create_game_embed(game)
                     await channel.send(f"{ping} **Currently FREE on PC!**", embed=embed, view=view)
@@ -122,7 +130,7 @@ class FreeGameNotifier(commands.Bot):
             if posted > 0:
                 logger.info(f"🚀 Posted {posted} currently free PC game(s)")
             else:
-                logger.info("No new posts this cycle (all current free games were posted recently)")
+                logger.info("All current free games were posted recently — no new notifications")
 
             self.db.update_last_check()
 
@@ -133,10 +141,22 @@ class FreeGameNotifier(commands.Bot):
     async def before_check(self):
         await self.wait_until_ready()
 
+    async def _fetch_with_retry(self, url: str, params: Optional[Dict] = None, max_retries: int = 3):
+        for attempt in range(max_retries):
+            try:
+                async with self.session.get(url, params=params, timeout=20) as resp:
+                    resp.raise_for_status()
+                    return await resp.json()
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    logger.error(f"Failed to fetch {url}")
+                    raise
+                await asyncio.sleep(2 ** attempt * 1.5)
+
     async def fetch_current_free_games(self) -> List[Dict[str, Any]]:
         games = []
 
-        # GamerPower - All giveaways, filter PC only
+        # GamerPower - All giveaways, filter to PC only
         try:
             data = await self._fetch_with_retry(f"{GAMERPOWER_BASE}/giveaways", {"type": "game", "sort-by": "date"})
             if isinstance(data, list):
@@ -189,7 +209,7 @@ class FreeGameNotifier(commands.Bot):
         except Exception as e:
             logger.error(f"Epic failed: {e}")
 
-        # Deduplication by title + platform
+        # Deduplication
         seen = set()
         return [g for g in games if (key := (g["title"].lower().strip(), g.get("platform", ""))) not in seen and not seen.add(key)]
 
