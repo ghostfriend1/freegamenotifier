@@ -3,7 +3,7 @@ import asyncio
 import logging
 import sqlite3
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Optional
 
 import discord
@@ -23,8 +23,6 @@ DB_FILE = "free_games_v3.db"
 
 GAMERPOWER_BASE = "https://gamerpower.com/api"
 EPIC_API = "https://store-site-backend-static.ak.epicgames.com/freeGamesPromotions"
-EPIC_LOCALE = "en-US"
-EPIC_COUNTRY = "US"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -34,15 +32,24 @@ class Database:
     def __init__(self):
         self.conn = sqlite3.connect(DB_FILE, check_same_thread=False)
         self.conn.execute("""CREATE TABLE IF NOT EXISTS seen_games (
-            giveaway_id TEXT PRIMARY KEY, title TEXT, platform TEXT, source TEXT,
-            first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP, last_posted TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
-        self.conn.execute("""CREATE TABLE IF NOT EXISTS bot_stats (key TEXT PRIMARY KEY, value TEXT)""")
+            giveaway_id TEXT PRIMARY KEY,
+            title TEXT,
+            platform TEXT,
+            source TEXT,
+            last_posted TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
         self.conn.commit()
 
-    def is_seen(self, giveaway_id: str) -> bool:
-        return self.conn.execute("SELECT 1 FROM seen_games WHERE giveaway_id = ?", (giveaway_id,)).fetchone() is not None
+    def should_post(self, giveaway_id: str) -> bool:
+        """Return True if we haven't posted this game in the last 24 hours"""
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        row = self.conn.execute(
+            "SELECT 1 FROM seen_games WHERE giveaway_id = ? AND last_posted > ?",
+            (giveaway_id, cutoff)
+        ).fetchone()
+        return row is None   # Not posted recently → should post
 
-    def mark_seen(self, giveaway_id: str, title: str, platform: str, source: str = "Unknown"):
+    def mark_posted(self, giveaway_id: str, title: str, platform: str, source: str = "Unknown"):
         now = datetime.now(timezone.utc).isoformat()
         self.conn.execute(
             "INSERT OR REPLACE INTO seen_games (giveaway_id, title, platform, source, last_posted) VALUES (?, ?, ?, ?, ?)",
@@ -80,20 +87,20 @@ class FreeGameNotifier(commands.Bot):
         self.session = aiohttp.ClientSession()
         self.check_free_games.start()
         await self.tree.sync()
-        logger.info("✅ Free Game Notifier v4.1 (PC Only) started")
+        logger.info("✅ Free Game Notifier v4.3 (Current Free Games) started")
 
         channel = self.get_channel(CHANNEL_ID)
         if channel:
-            await channel.send("🚀 **Free Game Notifier v4.1** is online — Fetching **PC games only** from all major platforms!")
+            await channel.send("🚀 **Free Game Notifier v4.3** is online — Now showing **currently free PC games**!")
 
     @tasks.loop(minutes=CHECK_INTERVAL_MINUTES, reconnect=True)
     async def check_free_games(self):
         try:
-            logger.info("🔍 Checking for new PC free games...")
-            new_games = await self.fetch_new_free_games()
+            logger.info("🔍 Checking for currently free PC games...")
+            current_free_games = await self.fetch_current_free_games()
 
-            if not new_games:
-                logger.info("No new PC games found this cycle.")
+            if not current_free_games:
+                logger.info("No currently free PC games found.")
                 self.db.update_last_check()
                 return
 
@@ -104,13 +111,19 @@ class FreeGameNotifier(commands.Bot):
 
             ping = f"<@&{PING_ROLE_ID}>" if PING_ROLE_ID else "@here"
             posted = 0
-            for game in new_games:
-                embed, view = self.create_game_embed(game)
-                await channel.send(f"{ping} **New FREE PC Game!**", embed=embed, view=view)
-                self.db.mark_seen(game["id"], game["title"], game.get("platform", "PC"), game.get("source", "Unknown"))
-                posted += 1
 
-            logger.info(f"🚀 Posted {posted} new PC game(s)")
+            for game in current_free_games:
+                if self.db.should_post(game["id"]):
+                    embed, view = self.create_game_embed(game)
+                    await channel.send(f"{ping} **Currently FREE on PC!**", embed=embed, view=view)
+                    self.db.mark_posted(game["id"], game["title"], game.get("platform", "PC"), game.get("source", "Unknown"))
+                    posted += 1
+
+            if posted > 0:
+                logger.info(f"🚀 Posted {posted} currently free PC game(s)")
+            else:
+                logger.info("No new posts this cycle (all current free games were posted recently)")
+
             self.db.update_last_check()
 
         except Exception as e:
@@ -120,48 +133,36 @@ class FreeGameNotifier(commands.Bot):
     async def before_check(self):
         await self.wait_until_ready()
 
-    async def _fetch_with_retry(self, url: str, params: Optional[Dict] = None, max_retries: int = 3):
-        for attempt in range(max_retries):
-            try:
-                async with self.session.get(url, params=params, timeout=20) as resp:
-                    resp.raise_for_status()
-                    return await resp.json()
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    raise
-                await asyncio.sleep(2 ** attempt * 1.5)
+    async def fetch_current_free_games(self) -> List[Dict[str, Any]]:
+        games = []
 
-    async def fetch_new_free_games(self) -> List[Dict[str, Any]]:
-        new_games: List[Dict[str, Any]] = []
-
-        # 1. GamerPower - All platforms, then filter for PC only
+        # GamerPower - All giveaways, filter PC only
         try:
             data = await self._fetch_with_retry(f"{GAMERPOWER_BASE}/giveaways", {"type": "game", "sort-by": "date"})
             if isinstance(data, list):
                 for item in data:
                     platforms = str(item.get("platforms", "")).lower()
                     if not any(p in platforms for p in ["pc", "steam", "gog", "epic", "ubisoft", "windows"]):
-                        continue  # Skip non-PC games
+                        continue
 
                     gid = str(item.get("id") or "")
-                    if gid and not self.db.is_seen(gid):
-                        new_games.append({
-                            "id": gid,
-                            "title": item.get("title", "Unknown Game"),
-                            "platform": item.get("platforms", "PC"),
-                            "description": (item.get("instructions") or item.get("description", ""))[:400],
-                            "image": item.get("image"),
-                            "worth": item.get("worth", "Free"),
-                            "end_date": item.get("end_date"),
-                            "open_giveaway_url": item.get("open_giveaway_url") or "",
-                            "gamerpower_url": f"https://gamerpower.com/giveaway/{gid}",
-                            "source": "GamerPower",
-                            "is_promo": str(item.get("worth", "")).startswith("$")
-                        })
+                    games.append({
+                        "id": gid,
+                        "title": item.get("title", "Unknown Game"),
+                        "platform": item.get("platforms", "PC"),
+                        "description": (item.get("instructions") or item.get("description", ""))[:400],
+                        "image": item.get("image"),
+                        "worth": item.get("worth", "Free"),
+                        "end_date": item.get("end_date"),
+                        "open_giveaway_url": item.get("open_giveaway_url") or "",
+                        "gamerpower_url": f"https://gamerpower.com/giveaway/{gid}",
+                        "source": "GamerPower",
+                        "is_promo": str(item.get("worth", "")).startswith("$")
+                    })
         except Exception as e:
-            logger.error(f"GamerPower fetch failed: {e}")
+            logger.error(f"GamerPower failed: {e}")
 
-        # 2. Direct Epic Games (PC only by nature)
+        # Direct Epic
         try:
             epic_data = await self._fetch_with_retry(EPIC_API, {"locale": EPIC_LOCALE, "country": EPIC_COUNTRY})
             if epic_data and isinstance(epic_data.get("data"), dict):
@@ -172,32 +173,25 @@ class FreeGameNotifier(commands.Bot):
                         for offer in offer_set.get("promotionalOffers", []):
                             if offer.get("discountSetting", {}).get("discountPercentage") == 0:
                                 gid = f"epic_{elem.get('id') or elem.get('productSlug')}"
-                                if gid and not self.db.is_seen(gid):
-                                    new_games.append({
-                                        "id": gid,
-                                        "title": elem.get("title", "Epic Game"),
-                                        "platform": "Epic Games Store",
-                                        "description": elem.get("description", "")[:400],
-                                        "image": None,
-                                        "worth": "Free",
-                                        "end_date": offer.get("endDate"),
-                                        "open_giveaway_url": f"https://store.epicgames.com/en-US/p/{elem.get('productSlug', '')}",
-                                        "gamerpower_url": "https://gamerpower.com",
-                                        "source": "Epic Games",
-                                        "is_promo": True
-                                    })
+                                games.append({
+                                    "id": gid,
+                                    "title": elem.get("title", "Epic Game"),
+                                    "platform": "Epic Games Store",
+                                    "description": elem.get("description", "")[:400],
+                                    "image": None,
+                                    "worth": "Free",
+                                    "end_date": offer.get("endDate"),
+                                    "open_giveaway_url": f"https://store.epicgames.com/en-US/p/{elem.get('productSlug', '')}",
+                                    "gamerpower_url": "https://gamerpower.com",
+                                    "source": "Epic Games",
+                                    "is_promo": True
+                                })
         except Exception as e:
-            logger.error(f"Epic fetch failed: {e}")
+            logger.error(f"Epic failed: {e}")
 
-        # Deduplication
+        # Deduplication by title + platform
         seen = set()
-        deduped = []
-        for g in new_games:
-            key = (g["title"].lower().strip(), g.get("platform", ""))
-            if key not in seen:
-                seen.add(key)
-                deduped.append(g)
-        return deduped
+        return [g for g in games if (key := (g["title"].lower().strip(), g.get("platform", ""))) not in seen and not seen.add(key)]
 
     def create_game_embed(self, game: Dict[str, Any]) -> tuple[discord.Embed, ClaimView]:
         title = game.get("title", "Unknown Game")
@@ -205,7 +199,7 @@ class FreeGameNotifier(commands.Bot):
         trends_url = f"https://trends.google.com/trends/explore?q={urllib.parse.quote_plus(title)}"
 
         embed = discord.Embed(
-            title=f"🎮 {title}",
+            title=f"🎮 {title} — Currently FREE",
             description=game.get("description", "No description available.")[:500],
             color=0x00ff00,
             timestamp=datetime.now(timezone.utc)
