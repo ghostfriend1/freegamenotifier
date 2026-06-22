@@ -1,0 +1,18 @@
+# Environment variables (your real token)
+.env
+
+# Database (your saved data)
+free_games_v3.db
+*.db
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE / Editor folders
+.vscode/
+.idea/
+
+# Logs
+*.log
